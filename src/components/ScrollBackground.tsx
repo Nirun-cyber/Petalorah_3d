@@ -10,19 +10,19 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
   overlayOpacity = 0.45,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const imagesRef = useRef<Array<HTMLImageElement | null>>([]);
-  const bitmapsRef = useRef<Array<ImageBitmap | null>>([]);
-  const currentFrameRef = useRef(0);
-  const targetFrameRef = useRef(0);
+  const bitmapsRef = useRef<Array<ImageBitmap | HTMLImageElement | null>>([]);
   const lastDrawnFrameRef = useRef(-1);
+  const rafIdRef = useRef<number | null>(null);
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
     const padNum = (n: number) => n.toString().padStart(3, '0');
 
-    imagesRef.current = new Array(totalFrames).fill(null);
     bitmapsRef.current = new Array(totalFrames).fill(null);
+
+    // Downsample bitmap width for maximum GPU memory efficiency & 0 lag
+    const targetWidth = Math.min(window.innerWidth > 0 ? window.innerWidth : 1280, 1280);
 
     const loadFrame = async (index: number) => {
       const img = new Image();
@@ -31,42 +31,61 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
       try {
         if (typeof img.decode === 'function') {
           await img.decode().catch(() => {});
+        } else {
+          await new Promise<void>((resolve) => {
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+          });
         }
 
         if (!isMounted) return;
-        imagesRef.current[index] = img;
 
-        // Pre-decode into ImageBitmap for zero-latency GPU rendering
+        // Convert to lightweight ImageBitmap with downsampled width
         if (typeof createImageBitmap === 'function') {
           try {
-            const bitmap = await createImageBitmap(img);
+            const bitmap = await createImageBitmap(img, {
+              resizeWidth: targetWidth,
+              resizeQuality: 'low',
+            });
             if (isMounted) {
               bitmapsRef.current[index] = bitmap;
             }
           } catch {
-            // Fallback to Image element if bitmap creation fails
+            bitmapsRef.current[index] = img;
           }
+        } else {
+          bitmapsRef.current[index] = img;
         }
 
         if (index === 0 && isMounted) {
           setIsReady(true);
         }
       } catch {
-        // Fallback for image load errors
+        // Fallback for image load error
       }
     };
 
     const loadAll = async () => {
-      // First priority: Load initial frame instantly
+      // Priority 1: Load initial frame instantly
       await loadFrame(0);
 
-      // Parallel batch loading to avoid main-thread saturation
+      // Priority 2: Load keyframes spaced evenly across timeline for instant response
+      const step = 6;
+      const keyframePromises = [];
+      for (let i = step; i < totalFrames; i += step) {
+        keyframePromises.push(loadFrame(i));
+      }
+      await Promise.all(keyframePromises);
+
+      // Priority 3: Load remaining intermediate frames in batches
       const batchSize = 16;
       for (let i = 0; i < totalFrames; i += batchSize) {
         if (!isMounted) break;
         const promises = [];
         for (let j = i; j < i + batchSize && j < totalFrames; j++) {
-          if (j !== 0) promises.push(loadFrame(j));
+          if (!bitmapsRef.current[j]) {
+            promises.push(loadFrame(j));
+          }
         }
         await Promise.all(promises);
       }
@@ -76,8 +95,11 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
 
     return () => {
       isMounted = false;
-      // Free GPU memory bitmaps on unmount
-      bitmapsRef.current.forEach((bm) => bm?.close());
+      bitmapsRef.current.forEach((bm) => {
+        if (bm && 'close' in bm && typeof bm.close === 'function') {
+          bm.close();
+        }
+      });
     };
   }, [totalFrames]);
 
@@ -85,48 +107,56 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Use alpha: false for faster GPU blitting
+    // Use alpha: false for direct GPU blitting without compositing overhead
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
 
-    let animationFrameId: number;
-    let lastTime = performance.now();
-
-    const updateTargetFrame = () => {
+    const render = () => {
       const scrollTop = window.scrollY || document.documentElement.scrollTop;
       const scrollHeight = document.documentElement.scrollHeight - window.innerHeight;
       const progress = Math.max(0, Math.min(1, scrollHeight > 0 ? scrollTop / scrollHeight : 0));
-      targetFrameRef.current = progress * (totalFrames - 1);
-    };
+      
+      const targetFrame = Math.min(
+        totalFrames - 1,
+        Math.floor(progress * totalFrames)
+      );
 
-    const drawFrame = (frameIdx: number) => {
-      // Fall back to nearest loaded frame if exact target frame is still decoding
-      let validIdx = frameIdx;
-      if (!bitmapsRef.current[validIdx] && !imagesRef.current[validIdx]) {
+      // Skip redrawing if frame index hasn't changed
+      if (targetFrame === lastDrawnFrameRef.current) {
+        rafIdRef.current = null;
+        return;
+      }
+
+      // Fast fallback to nearest loaded frame
+      let validIdx = targetFrame;
+      if (!bitmapsRef.current[validIdx]) {
         for (let offset = 1; offset < totalFrames; offset++) {
-          if (validIdx - offset >= 0 && (bitmapsRef.current[validIdx - offset] || imagesRef.current[validIdx - offset])) {
+          if (validIdx - offset >= 0 && bitmapsRef.current[validIdx - offset]) {
             validIdx = validIdx - offset;
             break;
           }
-          if (validIdx + offset < totalFrames && (bitmapsRef.current[validIdx + offset] || imagesRef.current[validIdx + offset])) {
+          if (validIdx + offset < totalFrames && bitmapsRef.current[validIdx + offset]) {
             validIdx = validIdx + offset;
             break;
           }
         }
       }
 
-      const bitmap = bitmapsRef.current[validIdx];
-      const img = imagesRef.current[validIdx];
-
-      const drawSource = bitmap || (img && img.complete ? img : null);
-      if (!drawSource) return;
+      const source = bitmapsRef.current[validIdx];
+      if (!source) {
+        rafIdRef.current = null;
+        return;
+      }
 
       const width = canvas.width;
       const height = canvas.height;
-      const naturalWidth = bitmap ? bitmap.width : (img ? img.naturalWidth : width);
-      const naturalHeight = bitmap ? bitmap.height : (img ? img.naturalHeight : height);
+      const naturalWidth = 'width' in source ? source.width : (source as HTMLImageElement).naturalWidth;
+      const naturalHeight = 'height' in source ? source.height : (source as HTMLImageElement).naturalHeight;
 
-      if (naturalWidth === 0 || naturalHeight === 0) return;
+      if (!naturalWidth || !naturalHeight) {
+        rafIdRef.current = null;
+        return;
+      }
 
       // Aspect-ratio cover
       const imgRatio = naturalWidth / naturalHeight;
@@ -145,59 +175,45 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
         offsetX = (width - renderWidth) / 2;
       }
 
-      ctx.drawImage(drawSource, offsetX, offsetY, renderWidth, renderHeight);
+      ctx.drawImage(source, offsetX, offsetY, renderWidth, renderHeight);
       lastDrawnFrameRef.current = validIdx;
+      rafIdRef.current = null;
     };
 
-    const loop = (now: number) => {
-      const deltaTime = Math.min((now - lastTime) / 1000, 0.1);
-      lastTime = now;
-
-      updateTargetFrame();
-
-      // Smooth exponential easing for fluid responsiveness
-      const diff = targetFrameRef.current - currentFrameRef.current;
-      const absDiff = Math.abs(diff);
-
-      if (absDiff > 0.001) {
-        const lerpFactor = Math.min(1, 1 - Math.exp(-24 * deltaTime));
-        currentFrameRef.current += diff * lerpFactor;
-
-        const currentIntFrame = Math.round(currentFrameRef.current);
-        if (currentIntFrame !== lastDrawnFrameRef.current) {
-          drawFrame(currentIntFrame);
-        }
+    const requestRender = () => {
+      if (rafIdRef.current === null) {
+        rafIdRef.current = requestAnimationFrame(render);
       }
-
-      animationFrameId = requestAnimationFrame(loop);
     };
 
     const handleResize = () => {
       if (canvas) {
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
         canvas.width = Math.floor(window.innerWidth * dpr);
         canvas.height = Math.floor(window.innerHeight * dpr);
         lastDrawnFrameRef.current = -1;
-        drawFrame(Math.round(currentFrameRef.current));
+        requestRender();
       }
     };
 
     handleResize();
     window.addEventListener('resize', handleResize);
-    window.addEventListener('scroll', updateTargetFrame, { passive: true });
+    window.addEventListener('scroll', requestRender, { passive: true });
 
-    animationFrameId = requestAnimationFrame(loop);
+    requestRender();
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      window.removeEventListener('scroll', updateTargetFrame);
-      cancelAnimationFrame(animationFrameId);
+      window.removeEventListener('scroll', requestRender);
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
     };
   }, [totalFrames, isReady]);
 
   return (
     <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden bg-black">
-      {/* High-Performance GPU Canvas Layer */}
+      {/* Zero-Lag GPU Canvas Layer */}
       <canvas
         ref={canvasRef}
         className="absolute inset-0 w-full h-full"
@@ -206,7 +222,7 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
           transform: 'translateZ(0)',
         }}
       />
-      {/* Contrast Gradient Overlays */}
+      {/* Contrast Overlay */}
       <div
         className="absolute inset-0 bg-gradient-to-b from-black/70 via-black/50 to-black/90 pointer-events-none"
         style={{ opacity: overlayOpacity + 0.2 }}
