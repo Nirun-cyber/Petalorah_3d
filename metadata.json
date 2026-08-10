@@ -1,0 +1,6 @@
+{
+  "name": "Haven Banner",
+  "description": "Minimalist black and white hero banner with DM Sans typography replicating the Haven landing page layout.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
