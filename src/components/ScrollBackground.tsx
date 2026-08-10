@@ -29,12 +29,8 @@ export const ScrollBackground: React.FC<ScrollBackgroundProps> = ({
       img.src = `/frames/ezgif-frame-${padNum(index + 1)}.jpg`;
 
       try {
-        if ('decode' in img) {
-          await img.decode();
-        } else {
-          await new Promise((res) => {
-            img.onload = res;
-          });
+        if (typeof img.decode === 'function') {
+          await img.decode().catch(() => {});
         }
 
         if (!isMounted) return;
